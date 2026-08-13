@@ -1,0 +1,46 @@
+{
+  "accounts": [
+    {
+      "name": "USCIS Account",
+      "username": "",
+      "password": "",
+      "totp_secret": "",
+      "cases": [
+        {
+          "case_number": "",
+          "nickname": "I-485"
+        },
+         {
+          "case_number": "",
+          "nickname": "I-485J"
+        },
+         {
+          "case_number": "",
+          "nickname": "I-131"
+        },
+         {
+          "case_number": "",
+          "nickname": "I-765"
+        }
+      ]
+    }
+  ],
+  "browser": {
+    "headless": true
+  },
+  "schedule": {
+    "loop": true,
+    "interval_minutes": 120,
+    "jitter_minutes": 20
+  },
+  "log_server": {
+    "enabled": true,
+    "port": 8080
+  },
+  "notifications": {
+    "discord": {
+      "enabled": true,
+      "webhook_url": "https://discord.com/api/webhooks/"
+    }
+  }
+}

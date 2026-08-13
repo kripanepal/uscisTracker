@@ -1,0 +1,27 @@
+services:
+  uscis-watcher:
+    build: .
+    container_name: uscis-watcher
+    restart: unless-stopped
+    shm_size: "2gb"   # Chrome is unstable with the tiny default /dev/shm
+    # Loop/interval/jitter/log-server settings now live in config.json
+    # ("schedule" and "log_server" sections) - no need to pass them here.
+    # -v just makes the console/log output verbose.
+    command: ["-v"]
+    ports:
+      # Web-based log viewer - open http://<this-machine-ip>:8080/ from any device on your network
+      - "8080:8080"
+    # TZ is baked into the image as America/Chicago; set it here too so it's
+    # easy to see/change without a rebuild. Log timestamps will use this zone.
+    # Uncomment LOG_SERVER_USER/PASS below to require a login on the log viewer
+    # (recommended - logs include your case numbers/nicknames).
+    environment:
+      - TZ=America/Chicago
+      # - LOG_SERVER_USER=someuser
+      # - LOG_SERVER_PASS=somepassword
+    volumes:
+      # Your credentials/config - read-only, never modified by the script
+      - ./config.json:/app/config.json:ro
+      # Everything the script writes (case data, changelog, session cookies)
+      # lives on the host here, so it survives container restarts/rebuilds
+      - ./output:/app/output

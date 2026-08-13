@@ -1,0 +1,7 @@
+.git
+.gitignore
+config.json
+output/
+README.md
+*.pyc
+__pycache__/

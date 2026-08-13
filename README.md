@@ -113,6 +113,16 @@ Edit `config.json`:
   ],
   "browser": {
     "headless": false
+  },
+  "log_server": {
+    "enabled": true,
+    "port": 8080
+  },
+  "notifications": {
+    "discord": {
+      "enabled": true,
+      "webhook_url": "https://discord.com/api/webhooks/..."
+    }
   }
 }
 ```
