@@ -127,6 +127,8 @@ Edit `config.json`:
 }
 ```
 
+When loop mode is enabled, checks run every hour on weekdays from 8:00 AM through 7:59 PM, and every two hours outside that window, with the configured random jitter. The log viewer's **Start check now** button can trigger an immediate check while the watcher is running.
+
 **Note:** The `totp_secret` is the base32 secret key shown when you set up 2FA on your USCIS account.
 
 ### 4. Run

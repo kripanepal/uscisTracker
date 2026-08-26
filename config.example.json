@@ -30,7 +30,8 @@
   },
   "schedule": {
     "loop": true,
-    "interval_minutes": 120,
+    "weekday_interval_minutes": 60,
+    "off_hours_interval_minutes": 120,
     "jitter_minutes": 20
   },
   "log_server": {

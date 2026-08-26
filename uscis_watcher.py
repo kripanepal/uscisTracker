@@ -56,16 +56,33 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def get_schedule_settings(config: dict, args) -> tuple[bool, int, int]:
-    """Resolve loop/interval/jitter from config.json's "schedule" section, with
-    CLI flags (when explicitly passed) taking priority for quick one-off overrides."""
+def get_schedule_settings(config: dict, args) -> tuple[bool, Optional[int], int, int, int]:
+    """Resolve loop/interval/jitter from config.json's "schedule" section."""
     schedule_cfg = config.get("schedule", {})
 
     loop = args.loop if args.loop is not None else bool(schedule_cfg.get("loop", False))
-    interval_minutes = args.interval_minutes if args.interval_minutes is not None else schedule_cfg.get("interval_minutes", 60)
+    interval_override = args.interval_minutes
+    legacy_interval = schedule_cfg.get("interval_minutes")
+    weekday_interval_minutes = schedule_cfg.get("weekday_interval_minutes", legacy_interval or 60)
+    off_hours_interval_minutes = schedule_cfg.get("off_hours_interval_minutes", legacy_interval or 120)
     jitter_minutes = args.jitter_minutes if args.jitter_minutes is not None else schedule_cfg.get("jitter_minutes", 15)
 
-    return loop, interval_minutes, jitter_minutes
+    return loop, interval_override, weekday_interval_minutes, off_hours_interval_minutes, jitter_minutes
+
+
+def get_check_interval_minutes(
+    now: Optional[datetime],
+    interval_override: Optional[int],
+    weekday_interval_minutes: int,
+    off_hours_interval_minutes: int,
+) -> int:
+    """Return the base delay for the next check using local time."""
+    if interval_override is not None:
+        return interval_override
+    current = now or datetime.now()
+    is_weekday = current.weekday() < 5
+    is_daytime = 8 <= current.hour < 20
+    return weekday_interval_minutes if is_weekday and is_daytime else off_hours_interval_minutes
 
 
 def get_log_server_settings(config: dict, args) -> tuple[bool, int]:
@@ -1433,21 +1450,23 @@ def run_once(args, watcher: Optional[USCISWatcher] = None) -> tuple[int, Optiona
 class GracefulStop:
     """Tracks whether we've been asked to shut down (SIGTERM/SIGINT)"""
 
-    def __init__(self):
+    def __init__(self, wake_event: Optional[threading.Event] = None):
         self.stop_requested = False
+        self.wake_event = wake_event or threading.Event()
         signal.signal(signal.SIGTERM, self._handle)
         signal.signal(signal.SIGINT, self._handle)
 
     def _handle(self, signum, frame):
         print(f"\nReceived signal {signum}, will stop after the current check completes...")
         self.stop_requested = True
+        self.wake_event.set()
 
-    def sleep(self, seconds: int):
-        """Sleep in 1-second increments so a stop request is honored promptly."""
-        for _ in range(seconds):
-            if self.stop_requested:
-                return
-            time.sleep(1)
+    def sleep(self, seconds: int) -> bool:
+        """Wait for the next scheduled check, an on-demand request, or shutdown."""
+        if self.wake_event.wait(max(0, seconds)):
+            self.wake_event.clear()
+            return not self.stop_requested
+        return False
 
 
 class _PrintToLogger:
@@ -1528,7 +1547,7 @@ def _render_status_html(statuses: list[dict], empty_message: str) -> str:
     return "\n".join(rows)
 
 
-def _render_log_viewer_page(log_file: Path, tail_lines: int = 200) -> str:
+def _render_log_viewer_page(log_file: Path, tail_lines: int = 100) -> str:
     """Build the full log viewer page server-side. No JS polling - refresh the
     page (or hit the Refresh link) to pull the latest state."""
     import html as _html
@@ -1564,10 +1583,15 @@ def _render_log_viewer_page(log_file: Path, tail_lines: int = 200) -> str:
   .session {{ color:#c9a86a; font-size:0.8rem; margin-top:0.3rem; }}
   pre {{ white-space: pre-wrap; word-break: break-word; font-size:0.8rem; line-height:1.4; background:#0a0a0a; border:1px solid #333; border-radius:6px; padding:0.75rem; }}
   .loglink {{ font-size:0.8rem; color:#888; }}
+    .check-form {{ margin:0.75rem 0 1rem; }}
+    .check-button {{ background:#315f9b; color:#fff; border:0; border-radius:4px; padding:0.5rem 0.75rem; cursor:pointer; font:inherit; }}
 </style>
 </head>
 <body>
 <div id="generated">Generated {generated_at} — <a class="refresh" href="/">Refresh</a></div>
+<form class="check-form" method="post" action="/check">
+    <button class="check-button" type="submit">Start check now</button>
+</form>
 
 <h2>Login status</h2>
 {login_status_html}
@@ -1582,7 +1606,7 @@ def _render_log_viewer_page(log_file: Path, tail_lines: int = 200) -> str:
 """
 
 
-def _make_log_request_handler(log_file: Path, auth_user: Optional[str], auth_pass: Optional[str]):
+def _make_log_request_handler(log_file: Path, auth_user: Optional[str], auth_pass: Optional[str], request_check):
     expected_auth = None
     if auth_user:
         expected_auth = "Basic " + base64.b64encode(f"{auth_user}:{auth_pass}".encode()).decode()
@@ -1628,13 +1652,28 @@ def _make_log_request_handler(log_file: Path, auth_user: Optional[str], auth_pas
                 self.send_response(404)
                 self.end_headers()
 
+        def do_POST(self):
+            if not self._authorized():
+                return
+
+            parsed = urlparse(self.path)
+            if parsed.path != "/check":
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            request_check()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
         def log_message(self, format, *args):
             pass
 
     return LogRequestHandler
 
 
-def start_log_server(log_file: Path, port: int) -> ThreadingHTTPServer:
+def start_log_server(log_file: Path, port: int, request_check=None) -> ThreadingHTTPServer:
     """Start the web-based log viewer in a background thread."""
     auth_user = os.environ.get("LOG_SERVER_USER")
     auth_pass = os.environ.get("LOG_SERVER_PASS")
@@ -1643,7 +1682,7 @@ def start_log_server(log_file: Path, port: int) -> ThreadingHTTPServer:
         print(f"WARNING: log viewer on port {port} has no authentication. "
               f"Set LOG_SERVER_USER and LOG_SERVER_PASS env vars to add a login.")
 
-    handler_cls = _make_log_request_handler(log_file, auth_user, auth_pass)
+    handler_cls = _make_log_request_handler(log_file, auth_user, auth_pass, request_check or (lambda: None))
     server = ThreadingHTTPServer(("0.0.0.0", port), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1660,7 +1699,7 @@ def main():
     parser.add_argument("--loop", action="store_true", default=None,
                          help="Run forever, checking on a schedule. Overrides config.json's schedule.loop.")
     parser.add_argument("--interval-minutes", type=int, default=None,
-                         help="Base minutes between checks in --loop mode. Overrides config.json's schedule.interval_minutes (default: 60).")
+                         help="Fixed base minutes between checks in --loop mode. Overrides the time-based schedule.")
     parser.add_argument("--jitter-minutes", type=int, default=None,
                          help="Random 0-N minute jitter added on top of the interval each cycle. Overrides config.json's schedule.jitter_minutes (default: 15). Use 0 to disable.")
     parser.add_argument("--log-server-port", type=int, default=None,
@@ -1682,11 +1721,14 @@ def main():
         print("Please create a config.json file with your USCIS credentials.")
         return
 
+    check_requested = threading.Event()
+    stopper = GracefulStop(check_requested)
+
     log_server_enabled, log_server_port = get_log_server_settings(config, args)
     if log_server_enabled:
-        start_log_server(LOG_FILE, log_server_port)
+        start_log_server(LOG_FILE, log_server_port, request_check=check_requested.set)
 
-    loop, interval_minutes, jitter_minutes = get_schedule_settings(config, args)
+    loop, interval_override, weekday_interval_minutes, off_hours_interval_minutes, jitter_minutes = get_schedule_settings(config, args)
 
     if not loop:
         total_changes, watcher = run_once(args)
@@ -1694,9 +1736,9 @@ def main():
             watcher.close()
         return
 
-    print(f"Running in loop mode - checking every {interval_minutes} minute(s) "
-          f"(+0-{jitter_minutes}m jitter). Press Ctrl+C or send SIGTERM to stop.")
-    stopper = GracefulStop()
+        print("Running in loop mode - checking hourly on weekdays from 8am-8pm, "
+                    f"every 2 hours otherwise (+0-{jitter_minutes}m jitter). "
+                    "Press Ctrl+C or send SIGTERM to stop.")
 
     active_watcher = None
 
@@ -1714,14 +1756,21 @@ def main():
                 cycle_config = load_config()
             except Exception:
                 cycle_config = config
-            _, interval_minutes, jitter_minutes = get_schedule_settings(cycle_config, args)
+            _, interval_override, weekday_interval_minutes, off_hours_interval_minutes, jitter_minutes = get_schedule_settings(cycle_config, args)
 
             jitter_seconds = random.randint(0, jitter_minutes * 60) if jitter_minutes > 0 else 0
+            interval_minutes = get_check_interval_minutes(
+                None,
+                interval_override,
+                weekday_interval_minutes,
+                off_hours_interval_minutes,
+            )
             wait_seconds = interval_minutes * 60 + jitter_seconds
             wait_minutes = wait_seconds / 60
             print(f"\nSleeping {wait_minutes:.1f} minute(s) until next check "
                   f"({interval_minutes}m base + {jitter_seconds // 60}m{jitter_seconds % 60:02d}s jitter)...")
-            stopper.sleep(wait_seconds)
+            if stopper.sleep(wait_seconds):
+                print("\nOn-demand check requested; starting now...")
     finally:
         if active_watcher:
             active_watcher.close()
