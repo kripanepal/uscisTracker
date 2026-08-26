@@ -107,7 +107,7 @@ def _format_discord_value(value) -> str:
     return str(value).replace("`", "'")
 
 
-def format_diff_discord(diff: Optional[dict]) -> str:
+def format_diff_discord(diff: Optional[dict], old_data: dict = None, new_data: dict = None) -> str:
     """Format actual changed values from DeepDiff for Discord."""
     if not diff:
         return "• No specific diff available."
@@ -117,6 +117,12 @@ def format_diff_discord(diff: Optional[dict]) -> str:
     for path, change in diff.get("values_changed", {}).items():
         clean_path = _clean_diff_path(path)
         lines.append(f"• **{clean_path}**")
+        lines.append(f"  Old: `{_format_discord_value(change.get('old_value'))}`")
+        lines.append(f"  New: `{_format_discord_value(change.get('new_value'))}`")
+
+    for path, change in diff.get("type_changes", {}).items():
+        clean_path = _clean_diff_path(path)
+        lines.append(f"• **{clean_path}** (type changed)")
         lines.append(f"  Old: `{_format_discord_value(change.get('old_value'))}`")
         lines.append(f"  New: `{_format_discord_value(change.get('new_value'))}`")
 
@@ -136,7 +142,16 @@ def format_diff_discord(diff: Optional[dict]) -> str:
         lines.append(f"• **Removed item:** `{clean_path}`")
         lines.append(f"  Value: `{_format_discord_value(value)}`")
 
-    return "\n".join(lines) if lines else "• No specific diff available."
+    if lines:
+        return "\n".join(lines)
+
+    if old_data is not None and new_data is not None:
+        json_delta = format_json_delta(old_data, new_data)
+        if json_delta:
+            truncated = json_delta if len(json_delta) <= 1500 else json_delta[:1500] + "\n…"
+            return "```diff\n" + truncated + "\n```"
+
+    return "• No specific diff available."
 
 
 def _send_discord_content(webhook_url: str, content: str) -> None:
@@ -193,7 +208,10 @@ def send_discord_notification(webhook_url: str, change_details: list[dict]) -> N
 
         for change in changes:
             case_lines.extend(["", f"**{change['label']}**"])
-            diff_text = format_diff_discord(change.get("diff"))
+            try:
+                diff_text = format_diff_discord(change.get("diff"), change.get("old_data"), change.get("new_data"))
+            except Exception as e:
+                diff_text = f"• (could not format diff: {e})"
             case_lines.extend(diff_text.splitlines())
 
         candidate = "\n".join(current_lines + case_lines)
