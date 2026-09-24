@@ -8,11 +8,14 @@ import argparse
 import base64
 import copy
 import difflib
+import hashlib
 import json
 import logging
 import os
 import random
 import signal
+import socket
+import struct
 import sys
 import threading
 import time
@@ -1512,7 +1515,7 @@ def _tail_file(path: Path, n_lines: int) -> str:
         return "(no logs yet)"
     with open(path, "r", errors="replace") as f:
         lines = f.readlines()
-    return "".join(lines[-n_lines:])
+    return "".join(reversed(lines[-n_lines:]))
 
 
 def _render_status_html(statuses: list[dict], empty_message: str) -> str:
@@ -1547,21 +1550,139 @@ def _render_status_html(statuses: list[dict], empty_message: str) -> str:
     return "\n".join(rows)
 
 
+def _build_log_page_data(log_file: Path, tail_lines: int = 100) -> dict:
+    """Gather everything the log viewer page (or its live WebSocket feed) needs.
+    log_text is left unescaped here - the client sets it via textContent, which
+    is safe on its own and doesn't decode HTML entities, so pre-escaping here
+    would show literal '&#x27;' etc. on every live update."""
+    return {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "login_status_html": _render_status_html(
+            load_all_login_statuses(),
+            "No login attempts recorded yet (sessions are reused across checks - this only updates when a real sign-in happens).",
+        ),
+        "fetch_status_html": _render_status_html(
+            load_all_fetch_statuses(),
+            "No case-data fetches recorded yet.",
+        ),
+        "log_text": _tail_file(log_file, tail_lines),
+    }
+
+
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept_key(key: str) -> str:
+    sha1 = hashlib.sha1((key + WS_MAGIC).encode("utf-8")).digest()
+    return base64.b64encode(sha1).decode("utf-8")
+
+
+def _recv_exact(sock, n: int) -> Optional[bytes]:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _ws_read_frame(sock) -> Optional[tuple[int, bytes]]:
+    """Read one client frame. Client frames are always masked per RFC 6455."""
+    head = _recv_exact(sock, 2)
+    if not head:
+        return None
+    b1, b2 = head[0], head[1]
+    opcode = b1 & 0x0F
+    masked = bool(b2 & 0x80)
+    length = b2 & 0x7F
+    if length == 126:
+        ext = _recv_exact(sock, 2)
+        if ext is None:
+            return None
+        length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+        ext = _recv_exact(sock, 8)
+        if ext is None:
+            return None
+        length = struct.unpack(">Q", ext)[0]
+    mask_key = _recv_exact(sock, 4) if masked else None
+    payload = _recv_exact(sock, length) if length else b""
+    if payload is None:
+        return None
+    if masked and mask_key:
+        payload = bytes(byte ^ mask_key[i % 4] for i, byte in enumerate(payload))
+    return opcode, payload
+
+
+def _ws_send_frame(sock, payload: bytes, opcode: int = 0x1) -> None:
+    header = bytearray()
+    header.append(0x80 | opcode)  # FIN + opcode; server frames are sent unmasked
+    length = len(payload)
+    if length <= 125:
+        header.append(length)
+    elif length <= 65535:
+        header.append(126)
+        header += struct.pack(">H", length)
+    else:
+        header.append(127)
+        header += struct.pack(">Q", length)
+    sock.sendall(bytes(header) + payload)
+
+
+def _ws_serve(sock, log_file: Path, poll_interval: int = 3) -> None:
+    """Push a fresh snapshot whenever the underlying data changes, checked every
+    poll_interval seconds. Also drains incoming client frames so pings/closes get
+    handled instead of piling up unread."""
+    last_snapshot = None
+    sock.settimeout(poll_interval)
+    try:
+        while True:
+            try:
+                frame = _ws_read_frame(sock)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:  # close
+                    break
+                if opcode == 0x9:  # ping
+                    _ws_send_frame(sock, payload, opcode=0xA)  # pong
+            except socket.timeout:
+                pass
+            except Exception:
+                break
+
+            try:
+                data = _build_log_page_data(log_file)
+            except Exception:
+                continue
+
+            snapshot = json.dumps(data, sort_keys=True)
+            if snapshot != last_snapshot:
+                try:
+                    _ws_send_frame(sock, json.dumps(data).encode("utf-8"))
+                except Exception:
+                    break
+                last_snapshot = snapshot
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def _render_log_viewer_page(log_file: Path, tail_lines: int = 100) -> str:
-    """Build the full log viewer page server-side. No JS polling - refresh the
-    page (or hit the Refresh link) to pull the latest state."""
+    """Build the full log viewer page. A background WebSocket connection pushes
+    fresh status boxes and log tail as soon as something changes - no manual
+    refresh needed. Falls back to showing stale data (with a red dot) if the
+    socket drops, and retries the connection automatically."""
     import html as _html
 
-    login_status_html = _render_status_html(
-        load_all_login_statuses(),
-        "No login attempts recorded yet (sessions are reused across checks - this only updates when a real sign-in happens).",
-    )
-    fetch_status_html = _render_status_html(
-        load_all_fetch_statuses(),
-        "No case-data fetches recorded yet.",
-    )
-    log_text = _html.escape(_tail_file(log_file, tail_lines))
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data = _build_log_page_data(log_file, tail_lines)
+    login_status_html = data["login_status_html"]
+    fetch_status_html = data["fetch_status_html"]
+    log_text = _html.escape(data["log_text"])
+    generated_at = data["generated_at"]
 
     return f"""<!doctype html>
 <html>
@@ -1585,22 +1706,68 @@ def _render_log_viewer_page(log_file: Path, tail_lines: int = 100) -> str:
   .loglink {{ font-size:0.8rem; color:#888; }}
     .check-form {{ margin:0.75rem 0 1rem; }}
     .check-button {{ background:#315f9b; color:#fff; border:0; border-radius:4px; padding:0.5rem 0.75rem; cursor:pointer; font:inherit; }}
+  #live-dot {{ display:inline-block; width:8px; height:8px; border-radius:50%; background:#3a3; margin-right:5px; vertical-align:middle; }}
+  #live-dot.stale {{ background:#a33; }}
 </style>
 </head>
 <body>
-<div id="generated">Generated {generated_at} — <a class="refresh" href="/">Refresh</a></div>
+<div id="generated"><span id="live-dot"></span>Generated {generated_at} — <a class="refresh" href="/">Full reload</a></div>
 <form class="check-form" method="post" action="/check">
     <button class="check-button" type="submit">Start check now</button>
 </form>
 
 <h2>Login status</h2>
-{login_status_html}
+<div id="login-status">{login_status_html}</div>
 
 <h2>API fetch status</h2>
-{fetch_status_html}
+<div id="fetch-status">{fetch_status_html}</div>
 
-<h2>Recent logs (last {tail_lines} lines) <span class="loglink">— <a class="refresh" href="/logs.txt?lines=5000">view full log</a></span></h2>
-<pre>{log_text}</pre>
+<h2>Recent logs (last {tail_lines} lines, newest first) <span class="loglink">— <a class="refresh" href="/logs.txt?lines=5000">view full log</a></span></h2>
+<pre id="log-content">{log_text}</pre>
+
+<script>
+(function() {{
+  var liveDot = document.getElementById('live-dot');
+  var generatedEl = document.getElementById('generated');
+
+  function applyData(data) {{
+    generatedEl.childNodes[1].nodeValue = 'Generated ' + data.generated_at + ' — ';
+    document.getElementById('login-status').innerHTML = data.login_status_html;
+    document.getElementById('fetch-status').innerHTML = data.fetch_status_html;
+
+    var logEl = document.getElementById('log-content');
+    var wasScrolledToTop = logEl.scrollTop < 10;
+    logEl.textContent = data.log_text;
+    if (wasScrolledToTop) {{
+      logEl.scrollTop = 0;
+    }}
+  }}
+
+  function connect() {{
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var ws = new WebSocket(protocol + '//' + location.host + '/ws' + location.search);
+
+    ws.onopen = function() {{
+      liveDot.classList.remove('stale');
+    }};
+    ws.onmessage = function(evt) {{
+      try {{
+        applyData(JSON.parse(evt.data));
+        liveDot.classList.remove('stale');
+      }} catch (e) {{}}
+    }};
+    ws.onclose = function() {{
+      liveDot.classList.add('stale');
+      setTimeout(connect, 3000);
+    }};
+    ws.onerror = function() {{
+      ws.close();
+    }};
+  }}
+
+  connect();
+}})();
+</script>
 </body>
 </html>
 """
@@ -1622,12 +1789,61 @@ def _make_log_request_handler(log_file: Path, auth_user: Optional[str], auth_pas
             self.end_headers()
             return False
 
+        def _authorized_ws(self, parsed) -> bool:
+            """Browsers can't set an Authorization header on a WebSocket handshake,
+            so /ws also accepts ?user=&pass= on the URL as a fallback."""
+            if expected_auth is None:
+                return True
+            if self.headers.get("Authorization") == expected_auth:
+                return True
+            qs = parse_qs(parsed.query)
+            user = qs.get("user", [None])[0]
+            pw = qs.get("pass", [None])[0]
+            return user == auth_user and pw == auth_pass
+
+        def _handle_websocket(self):
+            key = self.headers.get("Sec-WebSocket-Key")
+            if not key or self.headers.get("Upgrade", "").lower() != "websocket":
+                self.send_response(400)
+                self.end_headers()
+                return
+            accept = _ws_accept_key(key)
+            response = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            try:
+                self.wfile.write(response.encode("utf-8"))
+                self.wfile.flush()
+            except Exception:
+                return
+            _ws_serve(self.connection, log_file)
+
         def do_GET(self):
+            parsed = urlparse(self.path)
+
+            if parsed.path == "/ws":
+                if not self._authorized_ws(parsed):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                self._handle_websocket()
+                return
+
             if not self._authorized():
                 return
 
-            parsed = urlparse(self.path)
-            if parsed.path == "/logs.txt":
+            if parsed.path == "/data.json":
+                data = _build_log_page_data(log_file)
+                body = json.dumps(data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            elif parsed.path == "/logs.txt":
                 lines = 500
                 try:
                     lines = int(parse_qs(parsed.query).get("lines", ["500"])[0])
